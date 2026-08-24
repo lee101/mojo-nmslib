@@ -134,6 +134,21 @@ def test_large_explicit_parallel_batch_matches_serial():
         assert np.allclose(left[1], right[1])
 
 
+def test_small_parallel_request_stays_correct_below_threshold():
+    rng = np.random.default_rng(72)
+    data = rng.normal(size=(24, 9))
+    queries = rng.normal(size=(7, 9))
+    index = nmslib.init(space="l2")
+    index.addDataPointBatch(data)
+    index.createIndex({"M": 6, "efConstruction": 30, "seed": 4})
+    index.setQueryTimeParams({"efSearch": 24})
+    serial = index.knnQueryBatch(queries, k=4, num_threads=1)
+    requested_parallel = index.knnQueryBatch(queries, k=4, num_threads=4)
+    for left, right in zip(serial, requested_parallel):
+        assert np.array_equal(left[0], right[0])
+        assert np.array_equal(left[1], right[1])
+
+
 def test_save_load_round_trip(tmp_path):
     rng = np.random.default_rng(3)
     x, q = rng.normal(size=(300, 12)), rng.normal(size=12)

@@ -14,7 +14,7 @@ LIB = os.path.join(ROOT, "dist", "libmojo-nmslib.so")
 I = ctypes.c_int64
 
 _SIGNATURES = {
-    "mn_hnsw_search": ([I] * 17, None),
+    "mn_hnsw_search_batch": ([I] * 22, None),
     "mn_distances": ([I] * 6, None),
 }
 
@@ -63,6 +63,6 @@ def f64(array) -> np.ndarray:
 
 
 def addr(array: np.ndarray) -> int:
-    if array.dtype != np.float64 or not array.flags.c_contiguous or array.size == 0:
-        raise ValueError("FFI buffers must be non-empty C-contiguous float64 arrays")
+    if not array.flags.c_contiguous or array.size == 0:
+        raise ValueError("FFI buffers must be non-empty C-contiguous arrays")
     return int(array.ctypes.data)

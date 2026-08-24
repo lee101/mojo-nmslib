@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from enum import IntEnum
-from concurrent.futures import ThreadPoolExecutor
 import operator
 from typing import Iterable
 
@@ -26,6 +25,7 @@ class DistType(IntEnum):
 _SPACES = {"l2": 0, "l1": 1, "cosinesimil": 2, "negdotprod": 3}
 _BATCH_PARALLEL_WORK = 250_000
 _BATCH_MIN_QUERIES = 16
+_MAX_BATCH_SCRATCH_BYTES = 128 << 20
 _INT32_INFO = np.iinfo(np.int32)
 
 
@@ -72,6 +72,7 @@ class Index:
         self._levels: np.ndarray | None = None
         self._layers: list[list[list[int]]] | None = None
         self._base: np.ndarray | None = None
+        self._upper: np.ndarray | None = None
         self._entry = -1
         self._max_level = -1
         self._m = 16
@@ -80,7 +81,10 @@ class Index:
         self._ef_search = 100
         self._rng = np.random.default_rng(17)
         self._id_array: np.ndarray | None = None
+        self._identity_ids = False
         self._scratch: tuple[np.ndarray, ...] | None = None
+        self._batch_scratch: tuple[np.ndarray, ...] | None = None
+        self._batch_scratch_rows = 0
 
     def addDataPoint(self, data, id: int | None = None):
         if self._data is not None:
@@ -215,12 +219,19 @@ class Index:
                     entry = candidates[0]
             if level > self._max_level:
                 self._entry, self._max_level = node, int(level)
-        self._base = np.full((n, self._base_degree), -1.0, dtype=np.float64)
+        self._base = np.full((n, self._base_degree), -1, dtype=np.int32)
         for node, links in enumerate(self._layers[0]):
             self._base[node, : len(links)] = links
+        self._upper = np.full((max(1, self._max_level), n, self._m), -1, dtype=np.int32)
+        for layer in range(1, self._max_level + 1):
+            for node, links in enumerate(self._layers[layer]):
+                self._upper[layer - 1, node, : len(links)] = links
         self._pending.clear()
         self._id_array = np.asarray(self._ids, dtype=np.int32)
+        self._identity_ids = np.array_equal(self._id_array, np.arange(n, dtype=np.int32))
         self._scratch = None
+        self._batch_scratch = None
+        self._batch_scratch_rows = 0
         return None
 
     def setQueryTimeParams(self, params: dict):
@@ -237,21 +248,45 @@ class Index:
             raise ValueError(f"query dimension is {vector.size}, expected {self._data.shape[1]}")
         return _normalize(vector[None, :])[0] if self.space == "cosinesimil" else vector
 
-    def _new_scratch(self, n: int) -> tuple[np.ndarray, ...]:
-        return tuple(np.empty(n, dtype=np.float64) for _ in range(5))
+    def _new_scratch(self, n: int, rows: int = 1) -> tuple[np.ndarray, ...]:
+        size = n * rows
+        return (
+            np.empty(size, dtype=np.uint8),
+            np.empty(size, dtype=np.int32),
+            np.empty(size, dtype=np.float64),
+            np.empty(size, dtype=np.int32),
+            np.empty(size, dtype=np.float64),
+        )
 
-    def _search_prepared(self, vector: np.ndarray, k: int, scratch: tuple[np.ndarray, ...]):
+    def _search_prepared(
+        self,
+        vectors: np.ndarray,
+        k: int,
+        scratch: tuple[np.ndarray, ...],
+        workers: int = 1,
+        result_ids: np.ndarray | None = None,
+        result_distances: np.ndarray | None = None,
+    ):
         n, d = self._data.shape
-        entry = self._entry
-        for layer in range(self._max_level, 0, -1):
-            entry = self._greedy(vector, entry, layer)
         ef = min(n, max(k, self._ef_search))
-        result_ids = np.empty(k, dtype=np.float64)
-        result_distances = np.empty(k, dtype=np.float64)
+        vectors = np.ascontiguousarray(vectors.reshape(-1, d), dtype=np.float64)
+        if result_ids is None:
+            result_ids = np.empty((len(vectors), k), dtype=np.int32)
+        if result_distances is None:
+            result_distances = np.empty((len(vectors), k), dtype=np.float32)
         visited, candidate_ids, candidate_distances, top_ids, top_distances = scratch
-        lib().mn_hnsw_search(addr(self._data), addr(self._base), addr(vector), addr(result_ids), addr(result_distances), addr(visited), addr(candidate_ids), addr(candidate_distances), addr(top_ids), addr(top_distances), n, d, self._base_degree, entry, ef, k, _SPACES[self.space])
-        rows = result_ids.astype(np.int64)
-        return self._id_array[rows], result_distances.astype(np.float32)
+        lib().mn_hnsw_search_batch(
+            addr(self._data), addr(self._base), addr(self._upper), addr(vectors),
+            addr(result_ids), addr(result_distances), addr(visited), addr(candidate_ids),
+            addr(candidate_distances), addr(top_ids), addr(top_distances), n, d,
+            self._base_degree, self._m, self._max_level, self._entry, ef, k,
+            _SPACES[self.space], len(vectors), workers,
+        )
+        if self._identity_ids:
+            mapped_ids = result_ids
+        else:
+            mapped_ids = self._id_array[result_ids]
+        return mapped_ids, result_distances
 
     def knnQuery(self, query, k: int = 10):
         vector = self._prepared_query(query)
@@ -259,7 +294,8 @@ class Index:
         k = min(max(1, operator.index(k)), n)
         if self._scratch is None or self._scratch[0].size != n:
             self._scratch = self._new_scratch(n)
-        return self._search_prepared(vector, k, self._scratch)
+        ids, distances = self._search_prepared(vector, k, self._scratch)
+        return ids[0], distances[0]
 
     def knnQueryBatch(self, queries, k: int = 10, num_threads: int = 0):
         rows = f64(queries)
@@ -275,25 +311,25 @@ class Index:
         k = min(max(1, operator.index(k)), n)
         prepared = _normalize(rows) if self.space == "cosinesimil" else rows
         workers = int(num_threads)
-        work = len(prepared) * n * d
-        if len(prepared) < _BATCH_MIN_QUERIES or work < _BATCH_PARALLEL_WORK or workers < 2:
-            return [self.knnQuery(row, k) for row in prepared]
-
-        workers = min(workers, len(prepared))
-        chunk = (len(prepared) + workers - 1) // workers
-
-        def search_chunk(start: int, stop: int):
-            scratch = self._new_scratch(n)
-            return [(row, self._search_prepared(prepared[row], k, scratch)) for row in range(start, stop)]
-
-        spans = [(start, min(start + chunk, len(prepared))) for start in range(0, len(prepared), chunk)]
-        with ThreadPoolExecutor(max_workers=len(spans)) as pool:
-            chunks = list(pool.map(lambda span: search_chunk(*span), spans))
-        results = [None] * len(prepared)
-        for values in chunks:
-            for row, value in values:
-                results[row] = value
-        return results
+        result_ids = np.empty((len(prepared), k), dtype=np.int32)
+        result_distances = np.empty((len(prepared), k), dtype=np.float32)
+        bytes_per_query = 25 * n
+        block_size = max(1, min(len(prepared), _MAX_BATCH_SCRATCH_BYTES // bytes_per_query))
+        for start in range(0, len(prepared), block_size):
+            stop = min(start + block_size, len(prepared))
+            count = stop - start
+            parallel = count >= _BATCH_MIN_QUERIES and count * n * d >= _BATCH_PARALLEL_WORK and workers != 1
+            scratch_rows = count if parallel else 1
+            if self._batch_scratch is None or self._batch_scratch_rows < scratch_rows:
+                self._batch_scratch = self._new_scratch(n, scratch_rows)
+                self._batch_scratch_rows = scratch_rows
+            ids, distances = self._search_prepared(
+                prepared[start:stop], k, self._batch_scratch, workers,
+                result_ids[start:stop], result_distances[start:stop],
+            )
+            if not self._identity_ids:
+                result_ids[start:stop] = ids
+        return [(result_ids[row], result_distances[row]) for row in range(len(prepared))]
 
     def getDistance(self, id1: int, id2: int):
         if self._data is None:
@@ -330,12 +366,16 @@ class Index:
     def freeIndex(self):
         self._layers = None
         self._base = None
+        self._upper = None
         self._data = None
         self._levels = None
         self._pending.clear()
         self._ids.clear()
         self._id_array = None
+        self._identity_ids = False
         self._scratch = None
+        self._batch_scratch = None
+        self._batch_scratch_rows = 0
         self._entry = self._max_level = -1
 
     def saveIndex(self, filename: str, save_data: bool = False):
@@ -380,18 +420,25 @@ class Index:
         self._data = data
         self._ids = ids
         self._id_array = np.asarray(ids, dtype=np.int32)
+        self._identity_ids = np.array_equal(self._id_array, np.arange(n, dtype=np.int32))
         self._levels = np.asarray(levels, dtype=np.int64)
-        self._base = np.ascontiguousarray(base, dtype=np.float64)
+        self._base = np.ascontiguousarray(base, dtype=np.int32)
         self._entry, self._max_level = entry, max_level
         self._m, self._base_degree = m, self._base.shape[1]
         self._ef_construction = ef_construction
         self._layers = [[[] for _ in range(n)] for _ in range(max_level + 1)]
         self._scratch = None
+        self._batch_scratch = None
+        self._batch_scratch_rows = 0
         cursor = 0
         for layer_number, layer in enumerate(self._layers):
             for node in range(len(self._data)):
                 self._layers[layer_number][node] = [int(value) for value in links[offsets[cursor] : offsets[cursor + 1]]]
                 cursor += 1
+        self._upper = np.full((max(1, self._max_level), n, self._m), -1, dtype=np.int32)
+        for layer in range(1, self._max_level + 1):
+            for node, node_links in enumerate(self._layers[layer]):
+                self._upper[layer - 1, node, : len(node_links)] = node_links
         return None
 
 
